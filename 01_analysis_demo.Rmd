@@ -1,0 +1,490 @@
+---
+title: "MM-Janus"
+date: "2025-02-06"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    toc_depth: 5
+    number_sections: TRUE
+    theme: united
+    css: mystyles.css
+keep_md: no
+editor_options: 
+  chunk_output_type: console
+---
+  
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+here::i_am("MM/code/01_analysis_demo.Rmd")
+library(tidyverse)
+library(here)
+library(readxl)
+library(glue)
+library(kableExtra)
+library(janitor)
+library(lubridate)
+library(haven)
+library(survival)
+library(ggpubr)
+library(lme4)
+library(survminer)
+library(mice)
+library(gridExtra)
+library(grid)
+knitr::opts_chunk$set(fig.height = 9.5) 
+```
+
+# Intro
+The demo code for the manuscript: 
+Pre-diagnostic serum immune marker levels and multiple myeloma: A prospective longitudinal study using samples from the Janus Serum Bank in Norway 
+
+## Demo data
+
+```{r}
+demo_data <- read_rds(here("MM/code/demo_data.rds"))
+
+list_ts <- demo_data %>% 
+  group_by(JANUS_ID) %>% 
+  filter(cacostat==1) %>%
+  arrange(JANUS_ID,Date_of_blood_draw) %>% 
+  slice_tail(n=1) %>% 
+  ungroup() %>% 
+  mutate(time_sd=as.numeric(Date_of_blood_draw-Date_of_diagnosis)/365.25) %>% 
+  mutate(timegp=case_when(
+    time_sd>= (-8) ~ "<8",
+    time_sd< (-8) & time_sd>= (-25) ~ "8-25",
+    time_sd< (-25) ~ ">25")) %>% 
+  select(set,timegp)
+
+```
+
+
+## Imputation 
+
+```{r}
+
+data <- demo_data %>% 
+  select(-Date_of_diagnosis,-Date_of_blood_draw)
+
+data_ml <- data %>% 
+      mutate(bmi=as.numeric(bmi),
+         smoking=factor(smoking)) %>% 
+      mice(m=20, maxit = 50, seed = 500,print=F) 
+
+imputed_datasets <- lapply(1:20, function(i) complete(data_ml, i))
+
+```
+
+## Results
+
+### Conditional logistic regression 
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+imp_cond1x <- function(impdata){
+
+  impdata_long <- impdata %>%
+    left_join(demo_data %>% select(SampleID, Date_of_diagnosis,Date_of_blood_draw),
+              by="SampleID") %>% 
+    pivot_longer(cols = c("MCP3","MIP1a","TGFa","VEGF","FGF2","Fractalkine"),
+                 names_to = "marker",values_to = "value")
+  
+  d4 <- impdata_long %>% 
+    ungroup() %>% 
+    mutate(logvalue1=value) %>% 
+    mutate(bmiwho3=case_when(
+      bmi<25 ~ "<24.9",
+      bmi>=25 & bmi<30 ~ "25-29.9",
+      bmi>=30 ~ ">=30"))
+  
+  
+  m0 <- d4 %>% 
+    filter(gp %in% c("case1","control1")) %>%
+    mutate(smoking_gp=case_when(
+      smoking %in% c(1,2) ~ "ever",
+      smoking==3 ~ "never",
+      is.na(smoking) ~ "ever"),  
+      smoking_gp=factor(smoking_gp,levels=c("never","ever")),
+      bmiwho3=factor(bmiwho3,levels=c("<24.9", "25-29.9",">=30"))) %>% 
+    group_by(marker) %>% 
+    nest() %>% 
+    mutate(logistm=map(data, ~ clogit(as.numeric(cacostat) ~ logvalue1  +strata(set), data=.x)),
+           tlog=map(logistm, ~ broom::tidy(.x)),
+           nobs=map(logistm, ~ broom::glance(.x)),
+           
+           logist_bmi_smk=map(data, ~ clogit(as.numeric(cacostat) ~ logvalue1 +  bmiwho3 + smoking_gp  +strata(set), data=.x)),
+           tlog_bmi_smk=map(logist_bmi_smk, ~ broom::tidy(.x)) ,
+           nobs_bmi_smk=map(logist_bmi_smk, ~ broom::glance(.x)),
+           ci=map(logistm, ~ confint(.x)),
+           ci_bmi_smk=map(logist_bmi_smk, ~ confint(.x)))
+  return(m0)
+}
+
+
+results <- lapply(imputed_datasets, function(data) imp_cond1x(data))
+
+
+pool_marker_crude <- function(marker_index) {
+  pool(map(results, ~ .x$logistm[[marker_index]]))
+}
+
+
+pool_marker_list <- map(1:6, pool_marker_crude)
+
+
+pool_marker1_crude <- pool_marker_list[[1]]
+pool_marker2_crude <- pool_marker_list[[2]]
+pool_marker3_crude <- pool_marker_list[[3]]
+pool_marker4_crude <- pool_marker_list[[4]]
+pool_marker5_crude <- pool_marker_list[[5]]
+pool_marker6_crude <- pool_marker_list[[6]]
+
+res <- bind_rows(summary(pool_marker1_crude,conf.int=T,exponentiate=T),
+                 summary(pool_marker2_crude,conf.int=T,exponentiate=T),
+                 summary(pool_marker3_crude,conf.int=T,exponentiate=T),
+                 summary(pool_marker4_crude,conf.int=T,exponentiate=T),
+                 summary(pool_marker5_crude,conf.int=T,exponentiate=T),
+                 summary(pool_marker6_crude,conf.int=T,exponentiate=T)) %>% 
+  mutate(HR=round(estimate,2),
+         low=round(`2.5 %`,2),
+         upp=round(`97.5 %`,2)) %>% 
+  mutate(marker=results[[1]]$marker,
+         ci=paste0(low,"-",upp)) %>% 
+  select(marker,HR,low,upp,p.value)
+
+res %>% 
+  kbl(caption="POOL results- crude logistic regression") %>% 
+  kable_classic()
+
+
+pool_marker_adj <- function(marker_index) {
+  pool(map(results, ~ .x$logist_bmi_smk[[marker_index]]))
+}
+
+
+pool_marker_list_adj <- map(1:6, pool_marker_adj)
+
+pool_marker1_adj <- pool_marker_list_adj[[1]]
+pool_marker2_adj <- pool_marker_list_adj[[2]]
+pool_marker3_adj <- pool_marker_list_adj[[3]]
+pool_marker4_adj <- pool_marker_list_adj[[4]]
+pool_marker5_adj <- pool_marker_list_adj[[5]]
+pool_marker6_adj <- pool_marker_list_adj[[6]]
+
+
+res_adj <- bind_rows(summary(pool_marker1_adj,conf.int=T,exponentiate=T),
+                     summary(pool_marker2_adj,conf.int=T,exponentiate=T),
+                     summary(pool_marker3_adj,conf.int=T,exponentiate=T),
+                     summary(pool_marker4_adj,conf.int=T,exponentiate=T),
+                     summary(pool_marker5_adj,conf.int=T,exponentiate=T),
+                     summary(pool_marker6_adj,conf.int=T,exponentiate=T)) %>% 
+  filter(term=="logvalue1") %>% 
+  mutate(aHR=round(estimate,2),
+         low=round(`2.5 %`,2),
+         upp=round(`97.5 %`,2)) %>% 
+  mutate(marker=results[[1]]$marker,
+         ci=paste0(low,"-",upp)) %>% 
+  select(marker,aHR,low,upp,p.value)
+
+res_adj %>% 
+  kbl(caption="POOL results-adjusted conditional logistic regression") %>% 
+  kable_classic()
+
+```
+
+### time-stratify analysis
+
+```{r, echo=F, message=FALSE, warning=FALSE}
+imp_cond1_timex <- function(impdata,timegp){
+  impdata <- impdata %>% 
+    left_join(demo_data %>% select(SampleID, Date_of_diagnosis,Date_of_blood_draw),
+              by="SampleID") %>% 
+    filter(set %in% list_ts$set[list_ts$timegp==timegp])
+  
+  impdata_long <- impdata %>% 
+    pivot_longer(cols = c("MCP3","MIP1a","TGFa","VEGF","FGF2","Fractalkine"),
+                 names_to = "marker",values_to = "value")
+  
+  d4 <- impdata_long %>% 
+    ungroup() %>% 
+    mutate(logvalue1=value) %>% 
+    mutate(bmiwho3=case_when(
+      bmi<25 ~ "<24.9",
+      bmi>=25 & bmi<30 ~ "25-29.9",
+      bmi>=30 ~ ">=30"))
+  
+  
+  m0 <- d4 %>% 
+    filter(gp %in% c("case1","control1")) %>%
+    mutate(smoking_gp=case_when(
+      smoking %in% c(1,2) ~ "ever",
+      smoking==3 ~ "never",
+      is.na(smoking) ~ "ever"),  
+      smoking_gp=factor(smoking_gp,levels=c("never","ever")),
+      bmiwho3=factor(bmiwho3,levels=c("<24.9", "25-29.9",">=30"))) %>% 
+    group_by(marker) %>% 
+    nest() %>% 
+    mutate(logistm=map(data, ~ clogit(as.numeric(cacostat) ~ logvalue1  +strata(set), data=.x)),
+           tlog=map(logistm, ~ broom::tidy(.x)),
+           nobs=map(logistm, ~ broom::glance(.x)),
+           
+           logist_bmi_smk=map(data, ~ clogit(as.numeric(cacostat) ~ logvalue1 +  bmiwho3 + smoking_gp  +strata(set), data=.x)),
+           tlog_bmi_smk=map(logist_bmi_smk, ~ broom::tidy(.x)) ,
+           nobs_bmi_smk=map(logist_bmi_smk, ~ broom::glance(.x)),
+           ci=map(logistm, ~ confint(.x)),
+           ci_bmi_smk=map(logist_bmi_smk, ~ confint(.x)))
+  return(m0)
+}
+
+pool_marker_crude <- function(result,marker_index) {
+  pooled_results <- pool(map(result, ~ .x$logistm[[marker_index]]))
+  return(pooled_results)
+}
+
+results_1 <- lapply(imputed_datasets, function(data) imp_cond1_timex(data, "<8"))
+
+pool_marker_list <- map(1:6,~ pool_marker_crude(results_1,.x))
+
+dp1 <- bind_rows(summary(pool_marker_list[[1]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[2]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[3]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[4]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[5]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[6]],conf.int=T,exponentiate=T)) %>% 
+    mutate(HR=round(estimate,2),
+           low=round(`2.5 %`,2),
+           upp=round(`97.5 %`,2)) %>% 
+    mutate(marker=rep(results_1[[1]]$marker,each=1),
+           ci=paste0(low,"-",upp)) %>% 
+    filter(term=="logvalue1") %>% 
+    select(marker,HR,low,upp) %>% 
+    mutate(timegp="<8")
+
+
+results_2 <- lapply(imputed_datasets, function(data) imp_cond1_timex(data, "8-25"))
+pool_marker_list <- map(1:6,~ pool_marker_crude(results_2,.x))
+
+dp2 <-  bind_rows(summary(pool_marker_list[[1]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[2]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[3]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[4]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[5]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[6]],conf.int=T,exponentiate=T)) %>% 
+    mutate(HR=round(estimate,2),
+           low=round(`2.5 %`,2),
+           upp=round(`97.5 %`,2)) %>% 
+    mutate(marker=rep(results_2[[1]]$marker,each=1),
+           ci=paste0(low,"-",upp)) %>% 
+    filter(term=="logvalue1") %>% 
+    select(marker,HR,low,upp) %>% 
+    mutate(timegp="8-25")
+
+
+
+results_3 <- lapply(imputed_datasets, function(data) imp_cond1_timex(data, ">25"))
+pool_marker_list <- map(1:6,~ pool_marker_crude(results_3,.x))
+
+dp3 <-  bind_rows(summary(pool_marker_list[[1]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[2]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[3]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[4]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[5]],conf.int=T,exponentiate=T),
+                   summary(pool_marker_list[[6]],conf.int=T,exponentiate=T)) %>% 
+    mutate(HR=round(estimate,2),
+           low=round(`2.5 %`,2),
+           upp=round(`97.5 %`,2)) %>% 
+    mutate(marker=rep(results_3[[1]]$marker,each=1),
+           ci=paste0(low,"-",upp)) %>% 
+    filter(term=="logvalue1") %>% 
+    select(marker,HR,low,upp) %>% 
+  mutate(timegp=">25")
+
+dp <- bind_rows(dp1,dp2,dp3)
+
+
+res <- bind_rows(summary(pool_marker1_crude,conf.int=T,exponentiate=T),
+                 summary(pool_marker2_crude,conf.int=T,exponentiate=T),
+                 summary(pool_marker3_crude,conf.int=T,exponentiate=T),
+                 summary(pool_marker4_crude,conf.int=T,exponentiate=T),
+                 summary(pool_marker5_crude,conf.int=T,exponentiate=T),
+                 summary(pool_marker6_crude,conf.int=T,exponentiate=T)) %>% 
+  mutate(HR=round(estimate,2),
+         low=round(`2.5 %`,2),
+         upp=round(`97.5 %`,2)) %>% 
+  mutate(marker=results[[1]]$marker,
+         ci=paste0(low,"-",upp)) %>% 
+  select(marker,HR,low,upp) %>% 
+    mutate(timegp="all") 
+
+
+out_plot <- dp %>% 
+  tibble() %>% 
+  filter(marker %in% c("MIP1a","TGFa","VEGF")) %>% 
+  mutate(timegp=factor(timegp,levels=c("all","<8","8-25",">25")),
+         marker=factor(marker,levels=c("MCP3","MIP1a","TGFa","VEGF","FGF2","Fractalkine"),
+                       labels=c("MCP3","MIP1a","TGFa","VEGF","FGF2","Fractalkine"))) %>%   ggplot(aes(x=timegp,y=HR, ymin=low,ymax=upp, color=marker))+
+  geom_pointrange(aes(shape=timegp,linetype=timegp),position = position_dodge(width = 0.5),size=1.5,lwd=1.5)+
+  geom_hline(yintercept=1) +
+  labs(x="Years before diagnosis",y="Hazard ratio (95% CI)")+
+  theme_classic(base_size = 20) +
+scale_color_manual(values = c("MIP1a" = "#27afb3", "TGFa" = "#276ab3", "VEGF" = "#2927b3"),labels=c("MIP-1α", "TGF-α", "VEGF"))+
+  scale_linetype_manual(values = c("solid", "dashed", "dashed", "dashed"),guide="none")+
+  scale_shape_manual(values=c(16,16,16,16),guide = "none")+
+   theme(axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24)) 
+
+
+out_plot 
+
+
+```
+
+
+### Mixed effect model
+
+```{r, echo=F, message=FALSE, warning=FALSE}
+
+imp_mix1 <- function(impdata){
+  impdata <- impdata %>% 
+    left_join(demo_data %>% ungroup() %>% select(SampleID, Date_of_diagnosis,Date_of_blood_draw),
+              by="SampleID") %>% 
+    mutate(time_sd=as.numeric(Date_of_blood_draw-Date_of_diagnosis)/365.25,
+           timegp=case_when(
+             time_sd>= (-8) ~ "<8",
+             time_sd< (-8) & time_sd>= (-25) ~ "8-25",
+             time_sd< (-25) ~ ">25"))
+  
+  impdata_long <- impdata %>% 
+    pivot_longer(cols = c("MCP3","MIP1a","TGFa","VEGF","FGF2","Fractalkine"),
+                 names_to = "marker",values_to = "value")
+  
+  d4 <- impdata_long %>% 
+    ungroup() %>% 
+    mutate(logvalue1=value) %>% 
+    mutate(bmiwho3=case_when(
+      bmi<25 ~ "<24.9",
+      bmi>=25 & bmi<30 ~ "25-29.9",
+      bmi>=30 ~ ">=30"))
+  
+  
+  m1_mix <- d4 %>% 
+    mutate(smoking_gp=case_when(
+      smoking %in% c(1,2) ~ "ever",
+      smoking==3 ~ "never",
+      is.na(smoking) ~ "ever"),  
+      smoking_gp=factor(smoking_gp,levels=c("never","ever")),
+      bmiwho3=factor(bmiwho3,levels=c("<24.9", "25-29.9",">=30"))) %>% 
+    group_by(marker) %>% 
+    nest() %>% 
+    mutate(m_dit = map(data, ~ lmer(logvalue1 ~ 0 + cacostat +  cacostat:time_sd + bmiwho3 + smoking_gp+
+                                       (1|  set/JANUS_ID), data=.x)),
+            
+            m_dit1 = map(data, ~ lmer(logvalue1 ~ cacostat +  cacostat:time_sd + bmiwho3 + smoking_gp+
+                                       (1|  set/JANUS_ID), data=.x))) %>% 
+    mutate( est.slope  = map( m_dit, ~broom.mixed::tidy (.x,"fixed")$estimate),
+            m_dit_tidy = map( m_dit,~broom.mixed::tidy(.x,"fixed",conf.int=T))) %>% 
+    mutate( xplot = pmap(list(data, est.slope, marker), function(data,est.slope,marker){
+      
+      ggplot(data, aes(x=time_sd, y=logvalue1, color=cacostat))+
+        geom_point() +
+        scale_color_manual(values = c("green4", "red3"))+
+        geom_segment(aes(x = -42, xend = -1, y = est.slope[1]+est.slope[6]*-42, yend = est.slope[1]+est.slope[6]*-1), color="green4", linewidth=1.5 )+
+        geom_segment(aes(x = -42, xend = -1, y = est.slope[2]+ est.slope[7]*-42, yend = est.slope[2]+ est.slope[7]*-1), color="red3", linewidth=1.5 )+
+        labs(x="time before diagnosis",
+             y=marker,title="mixed model",
+             color = "Group")+
+        theme_bw()}) )  %>% 
+    mutate(m_dit_tidy=map(m_dit,~broom.mixed::tidy(.x,"fixed",conf.int=T)))
+  
+
+  return(m1_mix)
+}
+
+pool_marker_mix <- function(result,marker_index) {
+  pooled_results <- pool(map(result, ~ .x$m_dit1[[marker_index]]))
+  return(pooled_results)
+}
+
+results_mix <- lapply(imputed_datasets, function(data) imp_mix1(data))
+pool_marker_list <- map(1:6,~ pool_marker_mix(results_mix,.x))
+
+res <- bind_rows(summary(pool_marker_list[[1]],conf.int=T),
+                 summary(pool_marker_list[[2]],conf.int=T),
+                 summary(pool_marker_list[[3]],conf.int=T),
+                 summary(pool_marker_list[[4]],conf.int=T),
+                 summary(pool_marker_list[[5]],conf.int=T),
+                 summary(pool_marker_list[[6]],conf.int=T)) %>% 
+  mutate(marker=rep(results_mix[[1]]$marker,each=7),
+         ci=paste0(round(`2.5 %`,4)," ~ ",round(`97.5 %`,4))) %>% 
+  select(marker,term,estimate,ci,p.value)
+
+res %>% 
+  filter(term %in% c("(Intercept)","cacostat1","cacostat0:time_sd","cacostat1:time_sd")) %>% 
+  kbl(caption=paste0("POOL results-mixed model")) %>% 
+  kable_classic()
+
+```
+
+#### Figure for mixed effect model
+
+```{r, echo=F, message=FALSE, warning=FALSE}
+
+
+mplot <- function(i){
+  dm1_list <- map(1:20, ~ results_mix[[.x]]$data[[i]]$value)
+  dm1 <- bind_cols(dm1_list) %>% tibble()
+
+colnames(dm1) <- paste0("d",1:20)
+  
+dm1 <- dm1 %>% 
+  mutate(mean=rowMeans(select(., starts_with("d")))) %>% 
+  bind_cols(time_sd=results_mix[[1]]$data[[1]]$time_sd,
+            cacostat=results_mix[[1]]$data[[1]]$cacostat) %>% 
+  select(time_sd,mean,cacostat)
+
+  est.slope <- pool_marker_list[[i]]$pooled$estimate
+  
+marker <- results_mix[[1]]$marker[[i]]
+
+plot <- dm1 %>% 
+  mutate(cacostat=factor(cacostat,levels=c(0,1),labels=c("control","case"))) %>% 
+ ggplot(aes(x=time_sd, y=mean, color=cacostat))+
+        geom_point(alpha=0.5) +
+        scale_color_manual(values = c("#2d7bd1", "#ea801c"))+
+  geom_segment(aes(x = -42, xend = -1, y = est.slope[1]+est.slope[6]*-42, yend = est.slope[1]+est.slope[6]*-1), color="#2d7bd1", linewidth=1.2 )+
+        geom_segment(aes(x = -42, xend = -1, y = est.slope[2]+ est.slope[1] + est.slope[7]*-42, yend = est.slope[2]+ est.slope[1]+ est.slope[7]*-1), color="#ea801c", linewidth=1.2 )+
+  ylim(-2,3)+
+        labs(x="Years before diagnosis",
+             y=marker,
+             color = "Group")+
+        theme_bw()
+
+
+return(plot)
+}
+
+mplot1 <- mplot(1)
+mplot2 <- mplot(2)+ylab("MIP-1α")+labs(title="a")
+mplot3 <- mplot(3)+ylab("TGF-α")+labs(title="b")
+mplot4 <- mplot(4)+labs(title="c")
+mplot5 <- mplot(5)
+mplot6 <- mplot(6)
+
+arranged_plot <- ggarrange(mplot2,mplot3,mplot4,ncol=3,common.legend = T, legend = "right")
+  
+final_plot2 <- grid.arrange(
+  textGrob("Figure 2", gp = gpar(fontsize = 14, fontface = "bold"), hjust = 0, x = 0),
+  arranged_plot,
+  ncol = 1,
+  heights = c(0.1, 1) # Adjust heights as needed
+)
+
+final_plot2
+
+```
+
+```{r}
+sessionInfo()
+
+```
+
+
