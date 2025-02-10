@@ -8,26 +8,24 @@ output:
     toc_depth: 5
     number_sections: TRUE
     theme: united
-    css: mystyles.css
 keep_md: no
 editor_options: 
   chunk_output_type: console
 ---
   
 ```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
-here::i_am("MM/code/01_analysis_demo.Rmd")
+root <- rprojroot::is_rstudio_project
 library(tidyverse)
-library(here)
-library(readxl)
-library(glue)
+#library(readxl)
+#library(glue)
 library(kableExtra)
-library(janitor)
-library(lubridate)
-library(haven)
+#library(janitor)
+#library(lubridate)
+#library(haven)
 library(survival)
 library(ggpubr)
 library(lme4)
-library(survminer)
+#library(survminer)
 library(mice)
 library(gridExtra)
 library(grid)
@@ -41,7 +39,7 @@ Pre-diagnostic serum immune marker levels and multiple myeloma: A prospective lo
 ## Demo data
 
 ```{r}
-demo_data <- read_rds(here("MM/code/demo_data.rds"))
+demo_data <- root$find_file("demo_data.rds") %>% read_rds()
 
 list_ts <- demo_data %>% 
   group_by(JANUS_ID) %>% 
@@ -429,37 +427,69 @@ res %>%
 ```{r, echo=F, message=FALSE, warning=FALSE}
 
 
-mplot <- function(i){
+mplot <- function(i) {
   dm1_list <- map(1:20, ~ results_mix[[.x]]$data[[i]]$value)
   dm1 <- bind_cols(dm1_list) %>% tibble()
 
-colnames(dm1) <- paste0("d",1:20)
+  colnames(dm1) <- paste0("d", 1:20)
+    
+  dm1 <- 
+    dm1 %>% 
+    mutate(mean = rowMeans(select(., starts_with("d")))) %>% 
+    bind_cols(
+      time_sd = results_mix[[1]]$data[[1]]$time_sd,
+      cacostat = results_mix[[1]]$data[[1]]$cacostat
+    ) %>% 
+    select(time_sd, mean, cacostat)
   
-dm1 <- dm1 %>% 
-  mutate(mean=rowMeans(select(., starts_with("d")))) %>% 
-  bind_cols(time_sd=results_mix[[1]]$data[[1]]$time_sd,
-            cacostat=results_mix[[1]]$data[[1]]$cacostat) %>% 
-  select(time_sd,mean,cacostat)
-
-  est.slope <- pool_marker_list[[i]]$pooled$estimate
+    est.slope <- pool_marker_list[[i]]$pooled$estimate
+    
+  marker <- results_mix[[1]]$marker[[i]]
   
-marker <- results_mix[[1]]$marker[[i]]
-
-plot <- dm1 %>% 
-  mutate(cacostat=factor(cacostat,levels=c(0,1),labels=c("control","case"))) %>% 
- ggplot(aes(x=time_sd, y=mean, color=cacostat))+
-        geom_point(alpha=0.5) +
-        scale_color_manual(values = c("#2d7bd1", "#ea801c"))+
-  geom_segment(aes(x = -42, xend = -1, y = est.slope[1]+est.slope[6]*-42, yend = est.slope[1]+est.slope[6]*-1), color="#2d7bd1", linewidth=1.2 )+
-        geom_segment(aes(x = -42, xend = -1, y = est.slope[2]+ est.slope[1] + est.slope[7]*-42, yend = est.slope[2]+ est.slope[1]+ est.slope[7]*-1), color="#ea801c", linewidth=1.2 )+
-  ylim(-2,3)+
-        labs(x="Years before diagnosis",
-             y=marker,
-             color = "Group")+
-        theme_bw()
-
-
-return(plot)
+  plot <- 
+    dm1 %>% 
+    mutate(
+      cacostat = factor(
+        cacostat, 
+        levels = c(0, 1), 
+        labels = c("control", "case")
+      )
+    ) %>% 
+    ggplot(
+      aes(x = time_sd, y = mean, color = cacostat)
+    ) +
+    geom_point(alpha = 0.5) +
+    scale_color_manual(values = c("#2d7bd1", "#ea801c")) +
+    geom_segment(
+       aes(
+         x = -42, 
+         xend = -1, 
+         y = est.slope[1] + est.slope[6] * -42, 
+         yend = est.slope[1] + est.slope[6] * -1
+       ), 
+       color = "#2d7bd1", 
+       linewidth = 1.2
+    ) +
+    geom_segment(
+      aes(
+        x = -42, 
+        xend = -1, 
+        y = est.slope[2] + est.slope[1] + est.slope[7] * -42, 
+        yend = est.slope[2] + est.slope[1] + est.slope[7] * -1
+      ), 
+      color = "#ea801c", 
+      linewidth = 1.2 
+    ) +
+    ylim(-2, 3) +
+    labs(
+      x = "Years before diagnosis",
+      y = marker,
+      color = "Group"
+    ) +
+    theme_bw()
+  
+  
+  return(plot)
 }
 
 mplot1 <- mplot(1)
